@@ -5,6 +5,7 @@ __pycache__/
 Alpaca.env
 
 data/mr_cache/*.parquet
+data/source_csv/*.csv
 logs/
 results/*.csv
 results/*.json

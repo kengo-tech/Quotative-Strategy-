@@ -2,34 +2,44 @@
 
 Research prototype for a long-only equity macro regime overlay.
 
-The project tests whether a low-frequency SPY volume-confirmation signal can
-improve exposure timing after correction regimes without creating excessive
-opportunity cost.
+The final strategy candidate is a defensive four-signal price-based macro
+regime overlay. Earlier tests examined whether a low-frequency SPY
+volume-confirmation layer or a 12-1 month cross-momentum component improved
+the base strategy; both are retained as research diagnostics rather than final
+production signals.
 
 ## Research Question
 
-Does a low-frequency SPY volume-confirmation signal improve exposure timing
-after correction regimes without causing excessive opportunity cost?
+Can a price-based macro regime overlay reduce equity drawdowns without
+excessive opportunity cost?
 
 ## Hypothesis
 
-SPY volume-confirmed Follow-Through Days identify durable risk-on transitions.
-
-Economic mechanism: institutional buying after a correction should appear as
-index-level price gains on expanding volume.
+The final defensive four-signal specification uses faster price, volatility,
+and breadth information to scale equity exposure. The 12-1 month
+cross-momentum component is excluded because testing suggested it can lag
+regime transitions and dilute defensive de-risking during drawdowns.
 
 ## Strategy Overview
 
-The strategy compares two models:
+The final strategy uses:
 
-- `base_price_only`: price-based macro regime model using volatility, trend,
-  breadth, volatility regime, and cross-sectional momentum.
-- `price_plus_spy_volume_confirmation`: base model plus SPY volume-confirmation
-  events such as volume breakout, Follow-Through Day, Distribution Day, and
-  Heavy Distribution Day.
+- VIX proxy from SPY realized volatility
+- SPY trend
+- Market breadth
+- Volatility regime
+
+It excludes:
+
+- 12-1 month cross momentum
+- unconditional SPY volume-confirmation penalties
 
 The strategy is long-only. It does not forecast individual stock returns. It
 scales equity exposure from 0 to 100 percent using market-regime evidence.
+
+The repository still includes diagnostics comparing the final four-signal model
+against the legacy five-signal version and the tested SPY volume-confirmation
+extension.
 
 ## Main Validation Criteria
 

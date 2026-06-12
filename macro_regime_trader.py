@@ -6,6 +6,10 @@ All config, strategy logic, portfolio construction, and execution are in this fi
 
 Changes from v2
 ---------------
+- Final strategy candidate is now the Defensive 4-Signal Macro Regime Overlay:
+  VIX proxy, SPY trend, market breadth, and volatility regime.
+- 12-1 month cross momentum is excluded from the default base model after
+  ablation/OOS testing showed it can dilute drawdown control.
 - Adds a SPY volume-confirmation layer: volume breakout, Follow-Through Day,
   Distribution Day, and Heavy Distribution Day.
 - Keeps base_price_only as the control model and compares it directly against
@@ -49,15 +53,48 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from loguru import logger
-from dotenv import load_dotenv
-from apscheduler.schedulers.background import BackgroundScheduler
-from alpaca.trading.client import TradingClient
-from alpaca.trading.requests import MarketOrderRequest
-from alpaca.trading.enums import OrderSide, TimeInForce
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest, StockLatestTradeRequest
-from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+
+try:
+    from loguru import logger
+except ImportError:
+    class _FallbackLogger:
+        def __getattr__(self, name):
+            def _log(message="", *args, **kwargs):
+                text = f"{name.upper()}: {message}"
+                print(text.encode("ascii", "replace").decode("ascii"))
+            return _log
+        def remove(self): pass
+        def add(self, *args, **kwargs): pass
+    logger = _FallbackLogger()
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    def load_dotenv(*args, **kwargs):
+        return False
+
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+except ImportError:
+    BackgroundScheduler = None
+
+try:
+    from alpaca.trading.client import TradingClient
+    from alpaca.trading.requests import MarketOrderRequest
+    from alpaca.trading.enums import OrderSide, TimeInForce
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.requests import StockBarsRequest, StockLatestTradeRequest
+    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+except ImportError:
+    TradingClient = None
+    MarketOrderRequest = None
+    OrderSide = None
+    TimeInForce = None
+    StockHistoricalDataClient = None
+    StockBarsRequest = None
+    StockLatestTradeRequest = None
+    TimeFrame = None
+    TimeFrameUnit = None
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -78,12 +115,17 @@ PAPER      = True   # flip to False only for real money
 
 # Paths — own cache directory so it doesn't collide with the main engine
 DATA_DIR   = ROOT_DIR / "data" / "mr_cache"
+SOURCE_DATA_DIR = ROOT_DIR / "data" / "source_csv"
 LOG_DIR    = ROOT_DIR / "logs"
 RESULT_DIR = ROOT_DIR / "results"
 STATE_FILE = RESULT_DIR / "macro_live_state.json"
 LOG_FILE   = LOG_DIR   / "macro_engine.log"
 
-for _d in [DATA_DIR, LOG_DIR, RESULT_DIR]:
+LEGACY_CLASS_DATA_DIR = Path(
+    r"C:\Users\kutsu\OneDrive\デスクトップ\KENGO\SMU\Class\QF-621Quantitative Trading Strategies\Apr-18"
+)
+
+for _d in [DATA_DIR, SOURCE_DATA_DIR, LOG_DIR, RESULT_DIR]:
     _d.mkdir(parents=True, exist_ok=True)
 
 # ── Universes ─────────────────────────────────────────────────────────────────
@@ -144,6 +186,7 @@ VOL_SHORT        = 10    # short vol window (stress detection)
 VOL_LONG         = 30    # long vol window
 MOM_LONG         = 252   # 12-month momentum lookback
 MOM_SKIP         = 21    # skip most-recent month (reversal avoidance)
+USE_CROSS_MOMENTUM_IN_BASE = False  # final defensive 4-signal specification
 
 # ── SPY volume-confirmation layer ────────────────────────────────────────────
 # These are research defaults, not optimized values. Sensitivity analysis below
@@ -166,6 +209,11 @@ SPY_FTD_MIN_RETURN_GRID = [0.0100, 0.0125, 0.0150]
 SPY_VOLUME_STRONG_BREAKOUT_GRID = [1.10, 1.20, 1.30]
 VOLUME_CONFIRMATION_WEIGHT_GRID = [0.10, 0.15, 0.20]
 COST_SCENARIOS_BPS = [0.0, 5.0, 10.0, 20.0]
+
+BASE_MA_LONG_GRID = [150, 200, 250]
+BASE_BREADTH_MA_GRID = [40, 50, 60]
+BASE_VOL_SHORT_GRID = [10, 15]
+BASE_VOL_LONG_GRID = [30, 60]
 
 # ── Portfolio ─────────────────────────────────────────────────────────────────
 TRADING_DAYS       = 252
@@ -194,12 +242,18 @@ HARD_STOP_PCT      = 0.15
 USE_TRAILING_STOP  = False
 PRICE_MONITOR_SECS = 60
 
+_RUSSELL_SYMBOL_CACHE: dict[str, pd.DataFrame] = {}
+_RUSSELL_CACHE_PATH: Path | None = None
+_RISK_PARITY_ZERO_WARNED = False
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ALPACA CLIENTS
 # ══════════════════════════════════════════════════════════════════════════════
 
 def _trading_client() -> TradingClient:
+    if TradingClient is None:
+        raise RuntimeError("alpaca-py is not installed; live trading is unavailable.")
     if not API_KEY or not API_SECRET:
         raise RuntimeError(
             "ALPACA_PAPER_API_KEY_MR / ALPACA_PAPER_API_SECRET_MR not set in env"
@@ -208,6 +262,8 @@ def _trading_client() -> TradingClient:
 
 
 def _data_client() -> StockHistoricalDataClient:
+    if StockHistoricalDataClient is None:
+        raise RuntimeError("alpaca-py is not installed; Alpaca data download is unavailable.")
     if not API_KEY or not API_SECRET:
         raise RuntimeError(
             "ALPACA_PAPER_API_KEY_MR / ALPACA_PAPER_API_SECRET_MR not set in env"
@@ -229,6 +285,86 @@ def _cache_fresh(path: Path) -> bool:
     return (time.time() - path.stat().st_mtime) / 3600 < CACHE_EXPIRY_HOURS
 
 
+def _local_csv_dirs() -> list[Path]:
+    dirs = [SOURCE_DATA_DIR]
+    env_dir = os.getenv("MR_LOCAL_DATA_DIR")
+    if env_dir:
+        dirs.insert(0, Path(env_dir))
+    if LEGACY_CLASS_DATA_DIR.exists():
+        dirs.append(LEGACY_CLASS_DATA_DIR)
+    return dirs
+
+
+def _read_spy_csv(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    df.columns = [c.lower().replace(" ", "_") for c in df.columns]
+    df["date"] = pd.to_datetime(df["date"].astype(str), format="%Y%m%d", utc=True)
+    df = df.rename(columns={"adj_close": "adj_close"})
+    return (
+        df.set_index("date")[["open", "high", "low", "close", "volume"]]
+        .apply(pd.to_numeric, errors="coerce")
+        .dropna(subset=["close", "volume"])
+        .sort_index()
+    )
+
+
+def _load_russell_symbol_cache(path: Path):
+    global _RUSSELL_SYMBOL_CACHE, _RUSSELL_CACHE_PATH
+    if _RUSSELL_CACHE_PATH == path and _RUSSELL_SYMBOL_CACHE:
+        return
+    logger.info(f"Loading Russell source CSV once: {path}")
+    wanted = set(ALL_SYMBOLS)
+    chunks = []
+    usecols = ["ticker", "date", "open", "high", "low", "close", "volume"]
+    for chunk in pd.read_csv(path, usecols=usecols, chunksize=250_000, na_values=["null"]):
+        local = chunk[chunk["ticker"].isin(wanted)].copy()
+        if not local.empty:
+            chunks.append(local)
+    if not chunks:
+        _RUSSELL_SYMBOL_CACHE = {}
+        _RUSSELL_CACHE_PATH = path
+        return
+    all_df = pd.concat(chunks, ignore_index=True)
+    all_df["date"] = pd.to_datetime(all_df["date"].astype(str), format="%Y%m%d", utc=True)
+    for col in ["open", "high", "low", "close", "volume"]:
+        all_df[col] = pd.to_numeric(all_df[col], errors="coerce")
+    _RUSSELL_SYMBOL_CACHE = {}
+    for ticker, df in all_df.groupby("ticker"):
+        _RUSSELL_SYMBOL_CACHE[ticker] = (
+            df.set_index("date")[["open", "high", "low", "close", "volume"]]
+            .dropna(subset=["close", "volume"])
+            .sort_index()
+        )
+    _RUSSELL_CACHE_PATH = path
+
+
+def _read_russell_symbol_csv(path: Path, symbol: str) -> pd.DataFrame:
+    _load_russell_symbol_cache(path)
+    df = _RUSSELL_SYMBOL_CACHE.get(symbol)
+    if df is None:
+        return pd.DataFrame()
+    return (
+        df.copy()
+    )
+
+
+def _fetch_one_local_csv(symbol: str) -> pd.DataFrame:
+    for data_dir in _local_csv_dirs():
+        if symbol == MARKET_PROXY:
+            spy_path = data_dir / "SPY.csv"
+            if spy_path.exists():
+                logger.info(f"Loading {symbol} from local CSV: {spy_path}")
+                return _read_spy_csv(spy_path)
+
+        russell_path = data_dir / "russell1000pvdata.csv"
+        if russell_path.exists():
+            df = _read_russell_symbol_csv(russell_path, symbol)
+            if not df.empty:
+                logger.info(f"Loading {symbol} from local Russell CSV")
+                return df
+    return pd.DataFrame()
+
+
 def _fetch_one(symbol: str, use_cache: bool = True) -> pd.DataFrame:
     path = _cache_path(symbol)
     if use_cache and _cache_fresh(path):
@@ -237,6 +373,9 @@ def _fetch_one(symbol: str, use_cache: bool = True) -> pd.DataFrame:
     if use_cache and path.exists() and (not API_KEY or not API_SECRET):
         logger.warning(f"Using stale cache for {symbol}; Alpaca credentials are not set.")
         return pd.read_parquet(path)
+    local_df = _fetch_one_local_csv(symbol)
+    if not local_df.empty:
+        return local_df
     if not API_KEY or not API_SECRET:
         raise RuntimeError(
             f"No cached data for {symbol} and Alpaca credentials are not set. "
@@ -263,7 +402,10 @@ def _fetch_one(symbol: str, use_cache: bool = True) -> pd.DataFrame:
     df.index = pd.to_datetime(df.index, utc=True).normalize()
     df = df[["open", "high", "low", "close", "volume"]].sort_index()
     df = df[~df.index.duplicated(keep="last")]
-    df.to_parquet(path)
+    try:
+        df.to_parquet(path)
+    except Exception as e:
+        logger.warning(f"Could not write parquet cache for {symbol}: {e}")
     return df
 
 
@@ -358,33 +500,90 @@ def _cross_momentum(signal_close: pd.DataFrame) -> pd.Series:
 
 def compute_price_composite(close: pd.DataFrame) -> pd.Series:
     """
-    5-indicator price-based macro composite over time.
+    Final price-based macro composite over time.
 
     SPY is used only for VIX proxy, trend MA, and vol regime.
-    Breadth and cross-momentum use SIGNAL_UNIVERSE (22 independent stocks).
+    Breadth uses SIGNAL_UNIVERSE (22 independent stocks).
+    Cross momentum is excluded from the final defensive 4-signal specification
+    because ablation/OOS tests showed it can dilute de-risking during drawdowns.
     Returns series in [-1, +1].
     """
-    spy     = close[MARKET_PROXY]
-    spy_ret = np.log(spy / spy.shift(1))
+    components = compute_price_components(close)
+    exclude = [] if USE_CROSS_MOMENTUM_IN_BASE else ["cross_mom"]
+    return _composite_from_components(components, exclude).reindex(close.index).fillna(0.0)
 
-    sig_cols     = [s for s in SIGNAL_UNIVERSE if s in close.columns]
+
+def compute_price_components(close: pd.DataFrame) -> pd.DataFrame:
+    """Return the five base price-regime components for ablation diagnostics."""
+    spy = close[MARKET_PROXY]
+    spy_ret = np.log(spy / spy.shift(1))
+    sig_cols = [s for s in SIGNAL_UNIVERSE if s in close.columns]
+    signal_close = close[sig_cols]
+    return pd.concat(
+        [
+            _vix_proxy(spy_ret),
+            _equity_momentum(spy),
+            _market_breadth(signal_close),
+            _vol_regime(spy_ret),
+            _cross_momentum(signal_close),
+        ],
+        axis=1,
+    ).reindex(close.index).fillna(0.0)
+
+
+def _composite_from_components(components: pd.DataFrame, exclude: list[str] | None = None) -> pd.Series:
+    cols = [c for c in components.columns if c not in set(exclude or [])]
+    return components[cols].mean(axis=1).clip(-1.0, 1.0).rename("price_composite")
+
+
+def _scale_from_composite(composite: pd.Series) -> pd.Series:
+    return ((composite + 1.0) / 2.0).clip(0.0, 1.0)
+
+
+def compute_price_composite_with_params(
+    close: pd.DataFrame,
+    ma_long: int = MA_LONG,
+    breadth_ma: int = BREADTH_MA,
+    vol_short: int = VOL_SHORT,
+    vol_long: int = VOL_LONG,
+    include_cross_mom: bool = USE_CROSS_MOMENTUM_IN_BASE,
+) -> pd.Series:
+    """Parameterized base composite for robustness checks, not optimization."""
+    spy = close[MARKET_PROXY]
+    spy_ret = np.log(spy / spy.shift(1))
+    sig_cols = [s for s in SIGNAL_UNIVERSE if s in close.columns]
     signal_close = close[sig_cols]
 
-    components = [
-        _vix_proxy(spy_ret),
-        _equity_momentum(spy),
-        _market_breadth(signal_close),
-        _vol_regime(spy_ret),
-        _cross_momentum(signal_close),
-    ]
-    composite = (
-        pd.concat(components, axis=1)
+    vol = spy_ret.rolling(VIX_PROXY_WINDOW).std() * np.sqrt(252) * 100
+    vix_sig = pd.Series(0.0, index=spy_ret.index, name="vix_proxy")
+    vix_sig[vol < VIX_RISK_ON] = 1.0
+    vix_sig[vol >= VIX_RISK_OFF] = -1.0
+
+    ma = spy.rolling(ma_long, min_periods=ma_long // 2).mean()
+    trend_sig = np.sign(spy - ma).rename("equity_mom")
+
+    breadth_ma_px = signal_close.rolling(breadth_ma, min_periods=breadth_ma // 2).mean()
+    breadth = (signal_close > breadth_ma_px).astype(float).mean(axis=1)
+    breadth_sig = pd.Series(0.0, index=signal_close.index, name="breadth")
+    breadth_sig[breadth >= BREADTH_ON] = 1.0
+    breadth_sig[breadth <= BREADTH_OFF] = -1.0
+
+    v_short = spy_ret.rolling(vol_short).std()
+    v_long = spy_ret.rolling(vol_long).std()
+    vol_regime_sig = np.sign(v_long - v_short).rename("vol_regime")
+
+    component_list = [vix_sig, trend_sig, breadth_sig, vol_regime_sig]
+    if include_cross_mom:
+        component_list.append(_cross_momentum(signal_close))
+
+    return (
+        pd.concat(component_list, axis=1)
         .mean(axis=1)
         .clip(-1.0, 1.0)
         .reindex(close.index)
         .fillna(0.0)
+        .rename("price_composite")
     )
-    return composite.rename("price_composite")
 
 
 def _volume_params(
@@ -536,7 +735,7 @@ def compute_regime(
     ).clip(-1.0, 1.0).rename("final_composite")
     final_scale = ((final_composite + 1.0) / 2.0).clip(0.0, 1.0).rename("final_scale")
 
-    regime = pd.concat(
+    return pd.concat(
         [
             price_composite,
             base_scale,
@@ -546,7 +745,6 @@ def compute_regime(
         ],
         axis=1,
     )
-    return regime
 
 
 def compute_composite(close: pd.DataFrame, data: dict | None = None) -> pd.Series:
@@ -591,7 +789,10 @@ def risk_parity_weights(ret_window: pd.DataFrame, symbols: list) -> pd.Series:
     if total > 1e-9:
         w = w / total
     else:
-        logger.warning("risk_parity_weights: all weights zero — returning equal weight")
+        global _RISK_PARITY_ZERO_WARNED
+        if not _RISK_PARITY_ZERO_WARNED:
+            logger.warning("risk_parity_weights: all weights zero — returning equal weight")
+            _RISK_PARITY_ZERO_WARNED = True
         w[:] = 1.0 / len(avail)
 
     return w.reindex(symbols, fill_value=0.0)
@@ -603,14 +804,19 @@ def _walk_forward_weights(
     dates: pd.DatetimeIndex,
     scale: pd.Series,
 ) -> pd.DataFrame:
+    base_weights = _walk_forward_base_weights(returns, tradeable, dates)
+    return base_weights.mul(scale.reindex(dates).fillna(0.0), axis=0)
+
+
+def _walk_forward_base_weights(
+    returns: pd.DataFrame,
+    tradeable: list,
+    dates: pd.DatetimeIndex,
+) -> pd.DataFrame:
     wh = pd.DataFrame(0.0, index=dates, columns=tradeable)
     for i in range(RISK_LOOKBACK_DAYS, len(dates)):
-        sc = float(scale.iloc[i])
-        if sc < 0.05:
-            continue
         ret_window = returns[tradeable].iloc[i - RISK_LOOKBACK_DAYS : i]
-        base_w = risk_parity_weights(ret_window, tradeable)
-        wh.iloc[i] = base_w * sc
+        wh.iloc[i] = risk_parity_weights(ret_window, tradeable)
     return wh
 
 
@@ -708,17 +914,17 @@ def _strategy_weight_map(
     tradeable: list,
     dates: pd.DatetimeIndex,
     regime: pd.DataFrame,
+    base_rp_weights: pd.DataFrame | None = None,
 ) -> dict:
+    base_rp_weights = base_rp_weights if base_rp_weights is not None else _walk_forward_base_weights(
+        returns, tradeable, dates
+    )
     return {
         "equal_weight_10_stock": _equal_weight_weights(dates, tradeable),
-        "risk_parity_no_overlay": _walk_forward_weights(
-            returns, tradeable, dates, pd.Series(1.0, index=dates)
-        ),
-        "base_price_only": _walk_forward_weights(
-            returns, tradeable, dates, regime["base_scale"]
-        ),
-        "price_plus_spy_volume_confirmation": _walk_forward_weights(
-            returns, tradeable, dates, regime["final_scale"]
+        "risk_parity_no_overlay": base_rp_weights,
+        "base_price_only": base_rp_weights.mul(regime["base_scale"].reindex(dates), axis=0),
+        "price_plus_spy_volume_confirmation": base_rp_weights.mul(
+            regime["final_scale"].reindex(dates), axis=0
         ),
     }
 
@@ -832,6 +1038,10 @@ def _build_diagnostics(
 def _opportunity_cost_detail(
     regime: pd.DataFrame,
     strategy_returns: dict,
+    strategy_name: str = "price_plus_spy_volume_confirmation",
+    strategy_scale_col: str = "final_scale",
+    baseline_name: str = "base_price_only",
+    baseline_scale_col: str = "base_scale",
 ) -> pd.DataFrame:
     """
     Decompose v3-vs-base exposure changes into missed upside and avoided loss.
@@ -841,12 +1051,12 @@ def _opportunity_cost_detail(
     changing exposure scale rather than mixing in individual-stock selection.
     """
     idx = (
-        strategy_returns["base_price_only"].index
-        .intersection(strategy_returns["price_plus_spy_volume_confirmation"].index)
+        strategy_returns[baseline_name].index
+        .intersection(strategy_returns[strategy_name].index)
         .intersection(strategy_returns["risk_parity_no_overlay"].index)
     )
-    base_scale = regime["base_scale"].reindex(idx)
-    final_scale = regime["final_scale"].reindex(idx)
+    base_scale = regime[baseline_scale_col].reindex(idx)
+    final_scale = regime[strategy_scale_col].reindex(idx)
     rp_return = strategy_returns["risk_parity_no_overlay"]["gross_return"].reindex(idx)
 
     derisk_amount = (base_scale - final_scale).clip(lower=0.0)
@@ -873,12 +1083,14 @@ def _opportunity_cost_detail(
         + detail["upside_captured"]
         - detail["extra_loss"]
     )
-    detail["actual_v3_minus_base_return"] = (
-        strategy_returns["price_plus_spy_volume_confirmation"]["net_return"].reindex(idx)
-        - strategy_returns["base_price_only"]["net_return"].reindex(idx)
+    detail["strategy"] = strategy_name
+    detail["baseline_strategy"] = baseline_name
+    detail["actual_strategy_minus_base_return"] = (
+        strategy_returns[strategy_name]["net_return"].reindex(idx)
+        - strategy_returns[baseline_name]["net_return"].reindex(idx)
     )
-    detail["v3_derisked_vs_base"] = derisk_amount > 0
-    detail["v3_added_risk_vs_base"] = add_risk_amount > 0
+    detail["strategy_derisked_vs_base"] = derisk_amount > 0
+    detail["strategy_added_risk_vs_base"] = add_risk_amount > 0
     return detail
 
 
@@ -893,17 +1105,18 @@ def _summarize_opportunity_cost(detail: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for sample, sample_idx in samples.items():
         local = detail.reindex(sample_idx).dropna()
-        derisked = local[local["v3_derisked_vs_base"]]
-        added = local[local["v3_added_risk_vs_base"]]
+        derisked = local[local["strategy_derisked_vs_base"]]
+        added = local[local["strategy_added_risk_vs_base"]]
         total_oc = float(local["opportunity_cost"].sum())
         total_la = float(local["loss_avoided"].sum())
         total_upside = float(local["upside_captured"].sum())
         total_extra_loss = float(local["extra_loss"].sum())
         rows.append({
             "sample": sample,
+            "strategy": local["strategy"].iloc[0] if len(local) else "",
             "n_days": len(local),
-            "derisked_day_count": int(local["v3_derisked_vs_base"].sum()),
-            "added_risk_day_count": int(local["v3_added_risk_vs_base"].sum()),
+            "derisked_day_count": int(local["strategy_derisked_vs_base"].sum()),
+            "added_risk_day_count": int(local["strategy_added_risk_vs_base"].sum()),
             "total_opportunity_cost": round(total_oc, 4),
             "total_loss_avoided": round(total_la, 4),
             "net_defensive_timing_benefit": round(total_la - total_oc, 4),
@@ -913,7 +1126,7 @@ def _summarize_opportunity_cost(detail: pd.DataFrame) -> pd.DataFrame:
             "net_total_timing_benefit": round(
                 total_la - total_oc + total_upside - total_extra_loss, 4
             ),
-            "actual_v3_minus_base_return": round(float(local["actual_v3_minus_base_return"].sum()), 4),
+            "actual_strategy_minus_base_return": round(float(local["actual_strategy_minus_base_return"].sum()), 4),
             "derisked_positive_return_hit_rate": round(
                 float((derisked["risk_parity_reference_return"] > 0).mean())
                 if len(derisked) else 0.0,
@@ -976,6 +1189,7 @@ def _parameter_sensitivity_table(
     dollar_volume: pd.DataFrame,
     tradeable: list,
     dates: pd.DatetimeIndex,
+    base_rp_weights: pd.DataFrame,
 ) -> pd.DataFrame:
     rows = []
     for ftd_min_return in SPY_FTD_MIN_RETURN_GRID:
@@ -983,7 +1197,7 @@ def _parameter_sensitivity_table(
             for volume_weight in VOLUME_CONFIRMATION_WEIGHT_GRID:
                 params = _volume_params(ftd_min_return, strong_breakout, volume_weight)
                 regime = compute_regime(close, data, True, params)
-                wh = _walk_forward_weights(returns, tradeable, dates, regime["final_scale"])
+                wh = base_rp_weights.mul(regime["final_scale"].reindex(dates), axis=0)
                 frame = _portfolio_returns(
                     wh, returns, dollar_volume, True, TRANSACTION_COST_BPS, False
                 ).iloc[RISK_LOOKBACK_DAYS:-1].dropna()
@@ -1001,6 +1215,355 @@ def _parameter_sensitivity_table(
                     "average_final_scale": round(float(regime["final_scale"].mean()), 4),
                 })
     return pd.DataFrame(rows)
+
+
+def _base_ablation_table(
+    close: pd.DataFrame,
+    returns: pd.DataFrame,
+    dollar_volume: pd.DataFrame,
+    tradeable: list,
+    dates: pd.DatetimeIndex,
+    base_rp_weights: pd.DataFrame,
+) -> pd.DataFrame:
+    components = compute_price_components(close)
+    rows = []
+    final_cols = ["vix_proxy", "equity_mom", "breadth", "vol_regime"]
+    specs = {"defensive_4_signal_base": final_cols}
+    specs.update({f"without_{col}": [c for c in final_cols if c != col] for col in final_cols})
+    specs["legacy_5_signal_with_cross_mom"] = list(components.columns)
+    for spec_name, cols in specs.items():
+        composite = components[cols].mean(axis=1).clip(-1.0, 1.0).rename("price_composite")
+        scale = _scale_from_composite(composite)
+        wh = base_rp_weights.mul(scale.reindex(dates), axis=0)
+        frame = _portfolio_returns(
+            wh, returns, dollar_volume, True, TRANSACTION_COST_BPS, False
+        ).iloc[RISK_LOOKBACK_DAYS:-1].dropna()
+        rows.append({
+            "specification": spec_name,
+            "included_signals": ",".join(cols),
+            **_performance_metrics(frame["net_return"], frame["turnover"]),
+            "average_scale": round(float(scale.reindex(frame.index).mean()), 4),
+        })
+    return pd.DataFrame(rows)
+
+
+def _base_parameter_sensitivity_table(
+    close: pd.DataFrame,
+    returns: pd.DataFrame,
+    dollar_volume: pd.DataFrame,
+    tradeable: list,
+    dates: pd.DatetimeIndex,
+    base_rp_weights: pd.DataFrame,
+) -> pd.DataFrame:
+    rows = []
+    for ma_long in BASE_MA_LONG_GRID:
+        for breadth_ma in BASE_BREADTH_MA_GRID:
+            for vol_short in BASE_VOL_SHORT_GRID:
+                for vol_long in BASE_VOL_LONG_GRID:
+                    if vol_short >= vol_long:
+                        continue
+                    composite = compute_price_composite_with_params(
+                        close,
+                        ma_long=ma_long,
+                        breadth_ma=breadth_ma,
+                        vol_short=vol_short,
+                        vol_long=vol_long,
+                    )
+                    scale = _scale_from_composite(composite)
+                    wh = base_rp_weights.mul(scale.reindex(dates), axis=0)
+                    frame = _portfolio_returns(
+                        wh, returns, dollar_volume, True, TRANSACTION_COST_BPS, False
+                    ).iloc[RISK_LOOKBACK_DAYS:-1].dropna()
+                    metrics = _performance_metrics(frame["net_return"], frame["turnover"])
+                    rows.append({
+                        "MA_LONG": ma_long,
+                        "BREADTH_MA": breadth_ma,
+                        "VOL_SHORT": vol_short,
+                        "VOL_LONG": vol_long,
+                        "sharpe": metrics["sharpe"],
+                        "calmar": metrics["calmar"],
+                        "cagr": metrics["cagr"],
+                        "total_return": metrics["total_return"],
+                        "max_drawdown": metrics["max_drawdown"],
+                        "annual_vol": metrics["annual_vol"],
+                        "avg_daily_turnover": metrics["avg_daily_turnover"],
+                        "average_scale": round(float(scale.reindex(frame.index).mean()), 4),
+                    })
+    return pd.DataFrame(rows)
+
+
+def _base_subperiod_metrics_table(strategy_returns: dict, spy_returns: pd.Series) -> pd.DataFrame:
+    base_index = strategy_returns["base_price_only"].index
+    periods = {
+        "2010_2016": ("2010-01-01", "2016-12-31"),
+        "2017_2020": ("2017-01-01", "2020-12-31"),
+        "2021_plus": ("2021-01-01", None),
+    }
+    rows = []
+    for period, (start, end) in periods.items():
+        idx = base_index[base_index >= pd.Timestamp(start, tz="UTC")]
+        if end:
+            idx = idx[idx <= pd.Timestamp(end, tz="UTC")]
+        if len(idx) == 0:
+            continue
+        table = _metrics_table(strategy_returns, spy_returns, idx)
+        table = table[table["strategy"].isin([
+            "spy_buy_hold",
+            "risk_parity_no_overlay",
+            "base_price_only",
+        ])]
+        table["period"] = period
+        rows.append(table)
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+
+def _base_opportunity_cost_detail(
+    regime: pd.DataFrame,
+    strategy_returns: dict,
+) -> pd.DataFrame:
+    idx = (
+        strategy_returns["base_price_only"].index
+        .intersection(strategy_returns["risk_parity_no_overlay"].index)
+    )
+    base_scale = regime["base_scale"].reindex(idx)
+    rp_return = strategy_returns["risk_parity_no_overlay"]["gross_return"].reindex(idx)
+    derisk_amount = (1.0 - base_scale).clip(lower=0.0)
+    positive_ref = rp_return.clip(lower=0.0)
+    negative_ref = (-rp_return).clip(lower=0.0)
+
+    detail = pd.DataFrame(index=idx)
+    detail["signal_date"] = idx
+    detail["base_scale"] = base_scale
+    detail["risk_parity_reference_return"] = rp_return
+    detail["base_derisk_amount"] = derisk_amount
+    detail["opportunity_cost"] = derisk_amount * positive_ref
+    detail["loss_avoided"] = derisk_amount * negative_ref
+    detail["net_defensive_timing_benefit"] = detail["loss_avoided"] - detail["opportunity_cost"]
+    detail["actual_base_minus_no_overlay_return"] = (
+        strategy_returns["base_price_only"]["net_return"].reindex(idx)
+        - strategy_returns["risk_parity_no_overlay"]["net_return"].reindex(idx)
+    )
+    detail["base_derisked_vs_no_overlay"] = derisk_amount > 0
+    return detail
+
+
+def _summarize_base_opportunity_cost(detail: pd.DataFrame) -> pd.DataFrame:
+    idx = detail.index
+    split = int(len(idx) * 0.70)
+    samples = {
+        "full_sample": idx,
+        "in_sample": idx[:split],
+        "out_of_sample": idx[split:],
+    }
+    rows = []
+    for sample, sample_idx in samples.items():
+        local = detail.reindex(sample_idx).dropna()
+        derisked = local[local["base_derisked_vs_no_overlay"]]
+        total_oc = float(local["opportunity_cost"].sum())
+        total_la = float(local["loss_avoided"].sum())
+        rows.append({
+            "sample": sample,
+            "n_days": len(local),
+            "derisked_day_count": int(local["base_derisked_vs_no_overlay"].sum()),
+            "total_opportunity_cost": round(total_oc, 4),
+            "total_loss_avoided": round(total_la, 4),
+            "net_defensive_timing_benefit": round(total_la - total_oc, 4),
+            "opportunity_cost_ratio": round(total_oc / (total_la + 1e-12), 4),
+            "actual_base_minus_no_overlay_return": round(
+                float(local["actual_base_minus_no_overlay_return"].sum()), 4
+            ),
+            "derisked_positive_return_hit_rate": round(
+                float((derisked["risk_parity_reference_return"] > 0).mean())
+                if len(derisked) else 0.0,
+                4,
+            ),
+            "derisked_negative_return_hit_rate": round(
+                float((derisked["risk_parity_reference_return"] < 0).mean())
+                if len(derisked) else 0.0,
+                4,
+            ),
+        })
+    return pd.DataFrame(rows)
+
+
+def _max_drawdown_from_returns(ret: pd.Series) -> float:
+    ret = ret.dropna()
+    if ret.empty:
+        return 0.0
+    cum = (1.0 + ret).cumprod()
+    return float(((cum - cum.cummax()) / cum.cummax()).min())
+
+
+def _cross_mom_research_tables(
+    close: pd.DataFrame,
+    returns: pd.DataFrame,
+    dollar_volume: pd.DataFrame,
+    tradeable: list,
+    dates: pd.DatetimeIndex,
+    regime: pd.DataFrame,
+    base_rp_weights: pd.DataFrame,
+    strategy_returns: dict,
+    spy_fwd_returns: pd.Series,
+) -> dict:
+    components = compute_price_components(close)
+    legacy_composite = _composite_from_components(components, []).rename(
+        "price_composite_with_cross_mom"
+    )
+    legacy_scale = _scale_from_composite(legacy_composite).rename("scale_with_cross_mom")
+    final_composite = regime["price_composite"].rename("price_composite_without_cross_mom")
+    final_scale = regime["base_scale"].rename("scale_without_cross_mom")
+
+    legacy_weights = base_rp_weights.mul(legacy_scale.reindex(dates), axis=0)
+    legacy_returns = _portfolio_returns(
+        legacy_weights,
+        returns,
+        dollar_volume,
+        True,
+        TRANSACTION_COST_BPS,
+        False,
+    ).iloc[RISK_LOOKBACK_DAYS:-1].dropna()
+
+    cross_returns = {
+        "base_price_only": strategy_returns["base_price_only"],
+        "legacy_5_signal_with_cross_mom": legacy_returns,
+    }
+    comparison = _metrics_table(cross_returns, spy_fwd_returns)
+    comparison = comparison[comparison["strategy"].isin([
+        "base_price_only",
+        "legacy_5_signal_with_cross_mom",
+    ])]
+    oos = _oos_metrics_table(cross_returns, spy_fwd_returns)
+    oos = oos[oos["strategy"].isin(["base_price_only", "legacy_5_signal_with_cross_mom"])]
+    subperiod = _cross_mom_subperiod_metrics(cross_returns, spy_fwd_returns)
+
+    cross_regime = regime.copy()
+    cross_regime["scale_with_cross_mom"] = legacy_scale
+    extended_returns = dict(strategy_returns)
+    extended_returns["legacy_5_signal_with_cross_mom"] = legacy_returns
+    opportunity_detail = _opportunity_cost_detail(
+        cross_regime,
+        extended_returns,
+        strategy_name="base_price_only",
+        strategy_scale_col="base_scale",
+        baseline_name="legacy_5_signal_with_cross_mom",
+        baseline_scale_col="scale_with_cross_mom",
+    )
+    opportunity_summary = _summarize_opportunity_cost(opportunity_detail)
+
+    drawdown_episodes, timing_diagnostics = _cross_mom_drawdown_analysis(
+        close,
+        cross_returns,
+        legacy_composite,
+        final_composite,
+        legacy_scale,
+        final_scale,
+    )
+
+    return {
+        "comparison": comparison,
+        "oos": oos,
+        "subperiod": subperiod,
+        "opportunity_detail": opportunity_detail,
+        "opportunity_summary": opportunity_summary,
+        "drawdown_episodes": drawdown_episodes,
+        "timing_diagnostics": timing_diagnostics,
+    }
+
+
+def _cross_mom_subperiod_metrics(cross_returns: dict, spy_returns: pd.Series) -> pd.DataFrame:
+    base_index = cross_returns["base_price_only"].index
+    periods = {
+        "2010_2016": ("2010-01-01", "2016-12-31"),
+        "2017_2020": ("2017-01-01", "2020-12-31"),
+        "2021_plus": ("2021-01-01", None),
+    }
+    rows = []
+    for period, (start, end) in periods.items():
+        idx = base_index[base_index >= pd.Timestamp(start, tz="UTC")]
+        if end:
+            idx = idx[idx <= pd.Timestamp(end, tz="UTC")]
+        if len(idx) == 0:
+            continue
+        table = _metrics_table(cross_returns, spy_returns, idx)
+        table = table[table["strategy"].isin(["base_price_only", "legacy_5_signal_with_cross_mom"])]
+        table["period"] = period
+        rows.append(table)
+    return pd.concat(rows, ignore_index=True) if rows else pd.DataFrame()
+
+
+def _cross_mom_drawdown_analysis(
+    close: pd.DataFrame,
+    cross_returns: dict,
+    full_composite: pd.Series,
+    no_cross_composite: pd.Series,
+    full_scale: pd.Series,
+    no_cross_scale: pd.Series,
+    threshold: float = -0.10,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    spy = close[MARKET_PROXY].dropna()
+    spy_dd = spy / spy.cummax() - 1.0
+    in_dd = spy_dd <= threshold
+
+    episodes = []
+    start = None
+    for dt, active in in_dd.items():
+        if active and start is None:
+            start = dt
+        elif not active and start is not None:
+            episodes.append((start, prev_dt))
+            start = None
+        prev_dt = dt
+    if start is not None:
+        episodes.append((start, spy_dd.index[-1]))
+
+    episode_rows = []
+    timing_rows = []
+    for n, (start_dt, end_dt) in enumerate(episodes, start=1):
+        idx = full_scale.index[(full_scale.index >= start_dt) & (full_scale.index <= end_dt)]
+        if len(idx) == 0:
+            continue
+        base_ret = cross_returns["base_price_only"]["net_return"].reindex(idx).dropna()
+        no_cross_ret = cross_returns["base_price_only"]["net_return"].reindex(idx).dropna()
+        legacy_ret = cross_returns["legacy_5_signal_with_cross_mom"]["net_return"].reindex(idx).dropna()
+        local_spy_dd = spy_dd.reindex(idx).dropna()
+        scale_diff = no_cross_scale.reindex(idx) - full_scale.reindex(idx)
+        more_defensive = scale_diff < -0.05
+        less_defensive = scale_diff > 0.05
+        first_more_defensive = scale_diff[more_defensive].index.min() if more_defensive.any() else pd.NaT
+
+        episode_rows.append({
+            "episode": n,
+            "start_date": start_dt,
+            "end_date": end_dt,
+            "n_days": len(idx),
+            "spy_min_drawdown": round(float(local_spy_dd.min()), 4) if len(local_spy_dd) else 0.0,
+            "avg_scale_with_cross_mom": round(float(full_scale.reindex(idx).mean()), 4),
+            "avg_scale_without_cross_mom": round(float(no_cross_scale.reindex(idx).mean()), 4),
+            "avg_scale_diff_without_minus_with": round(float(scale_diff.mean()), 4),
+            "days_without_cross_more_defensive": int(more_defensive.sum()),
+            "days_without_cross_less_defensive": int(less_defensive.sum()),
+            "first_more_defensive_date": first_more_defensive,
+            "legacy_with_cross_episode_return": round(float((1.0 + legacy_ret).prod() - 1.0), 4) if len(legacy_ret) else 0.0,
+            "without_cross_episode_return": round(float((1.0 + no_cross_ret).prod() - 1.0), 4) if len(no_cross_ret) else 0.0,
+            "legacy_with_cross_episode_max_drawdown": round(_max_drawdown_from_returns(legacy_ret), 4),
+            "without_cross_episode_max_drawdown": round(_max_drawdown_from_returns(no_cross_ret), 4),
+        })
+
+        local = pd.DataFrame(index=idx)
+        local["episode"] = n
+        local["signal_date"] = idx
+        local["spy_drawdown"] = spy_dd.reindex(idx)
+        local["price_composite_with_cross_mom"] = full_composite.reindex(idx)
+        local["price_composite_without_cross_mom"] = no_cross_composite.reindex(idx)
+        local["scale_with_cross_mom"] = full_scale.reindex(idx)
+        local["scale_without_cross_mom"] = no_cross_scale.reindex(idx)
+        local["scale_diff_without_minus_with"] = scale_diff.reindex(idx)
+        local["legacy_with_cross_return"] = cross_returns["legacy_5_signal_with_cross_mom"]["net_return"].reindex(idx)
+        local["without_cross_return"] = cross_returns["base_price_only"]["net_return"].reindex(idx)
+        timing_rows.append(local.reset_index(drop=True))
+
+    timing = pd.concat(timing_rows, ignore_index=True) if timing_rows else pd.DataFrame()
+    return pd.DataFrame(episode_rows), timing
 
 
 def _df_to_markdown(df: pd.DataFrame) -> str:
@@ -1026,6 +1589,15 @@ def _write_research_summary(
     oos_metrics: pd.DataFrame,
     parameter_sensitivity: pd.DataFrame,
     opportunity_summary: pd.DataFrame,
+    base_ablation: pd.DataFrame,
+    base_parameter_sensitivity: pd.DataFrame,
+    base_subperiod_metrics: pd.DataFrame,
+    base_opportunity_summary: pd.DataFrame,
+    cross_mom_comparison: pd.DataFrame,
+    cross_mom_oos: pd.DataFrame,
+    cross_mom_subperiod: pd.DataFrame,
+    cross_mom_opportunity_summary: pd.DataFrame,
+    cross_mom_drawdown_episodes: pd.DataFrame,
     signal_stats: dict,
 ):
     metric_lookup = metrics.set_index("strategy")
@@ -1060,6 +1632,9 @@ def _write_research_summary(
         "",
         "## Failure condition",
         "If v3 does not improve drawdown metrics, or if the results disappear under out-of-sample and sensitivity tests, the Follow-Through Day layer is not robust.",
+        "",
+        "## Hypothesis evolution",
+        "The v3 model tested whether FTD and SPY volume confirmation improve risk-on timing. Empirically, v3 slightly reduced volatility and Max Drawdown, but worsened Calmar because opportunity cost exceeded loss avoided. This suggests that unconditional daily volume penalties are too noisy and too costly. Therefore, the final strategy candidate returns to the simpler `base_price_only` macro regime overlay, and robustness tests focus on whether the base model is stable across signal ablations, parameter choices, subperiods, and opportunity-cost diagnostics.",
         "",
         "## 2. Economic rationale",
         "The base model estimates broad equity risk appetite from SPY volatility, trend, market breadth, volatility regime, and cross-sectional momentum. The v3 layer asks whether SPY volume confirmation adds information about institutional accumulation or distribution.",
@@ -1129,6 +1704,39 @@ def _write_research_summary(
         "",
         "## 9. Parameter sensitivity",
         _df_to_markdown(parameter_sensitivity),
+        "",
+        "## 9b. Base model robustness",
+        "Because the volume layer did not add robust incremental value, the final strategy candidate is the simpler price-only macro regime overlay. The following tests evaluate whether the base model itself is robust.",
+        "",
+        "### Base signal ablation",
+        _df_to_markdown(base_ablation),
+        "",
+        "### Base parameter sensitivity",
+        _df_to_markdown(base_parameter_sensitivity),
+        "",
+        "### Base subperiod metrics",
+        _df_to_markdown(base_subperiod_metrics),
+        "",
+        "### Base opportunity cost versus no-overlay risk parity",
+        _df_to_markdown(base_opportunity_summary),
+        "",
+        "## 9c. Cross-momentum exclusion test",
+        "Ablation suggested that the 12-1 month cross-momentum component may be too slow for a drawdown-control overlay. This section formally compares the full base model against a defensive four-signal version that excludes cross momentum.",
+        "",
+        "### Full-sample comparison",
+        _df_to_markdown(cross_mom_comparison),
+        "",
+        "### OOS comparison",
+        _df_to_markdown(cross_mom_oos),
+        "",
+        "### Subperiod comparison",
+        _df_to_markdown(cross_mom_subperiod),
+        "",
+        "### Drawdown episode analysis",
+        _df_to_markdown(cross_mom_drawdown_episodes),
+        "",
+        "### Opportunity cost of excluding cross momentum",
+        _df_to_markdown(cross_mom_opportunity_summary),
         "",
         "## Signal frequency and scale diagnostics",
         _df_to_markdown(pd.DataFrame([signal_stats])),
@@ -1201,7 +1809,8 @@ def run_backtest(
     dates     = close.index
 
     logger.info("Running walk-forward research comparison…")
-    weights = _strategy_weight_map(returns, tradeable, dates, regime)
+    base_rp_weights = _walk_forward_base_weights(returns, tradeable, dates)
+    weights = _strategy_weight_map(returns, tradeable, dates, regime, base_rp_weights)
     strategy_returns = _strategy_return_map(
         returns, dollar_volume, weights, cost_bps=TRANSACTION_COST_BPS
     )
@@ -1213,10 +1822,30 @@ def run_backtest(
     cost_sensitivity = _cost_sensitivity_table(weights, returns, dollar_volume, spy_fwd_returns)
     oos_metrics = _oos_metrics_table(strategy_returns, spy_fwd_returns)
     parameter_sensitivity = _parameter_sensitivity_table(
-        close, data, returns, dollar_volume, tradeable, dates
+        close, data, returns, dollar_volume, tradeable, dates, base_rp_weights
     )
     opportunity_detail = _opportunity_cost_detail(regime, strategy_returns)
     opportunity_summary = _summarize_opportunity_cost(opportunity_detail)
+    base_ablation = _base_ablation_table(
+        close, returns, dollar_volume, tradeable, dates, base_rp_weights
+    )
+    base_parameter_sensitivity = _base_parameter_sensitivity_table(
+        close, returns, dollar_volume, tradeable, dates, base_rp_weights
+    )
+    base_subperiod_metrics = _base_subperiod_metrics_table(strategy_returns, spy_fwd_returns)
+    base_opportunity_detail = _base_opportunity_cost_detail(regime, strategy_returns)
+    base_opportunity_summary = _summarize_base_opportunity_cost(base_opportunity_detail)
+    cross_mom_tables = _cross_mom_research_tables(
+        close,
+        returns,
+        dollar_volume,
+        tradeable,
+        dates,
+        regime,
+        base_rp_weights,
+        strategy_returns,
+        spy_fwd_returns,
+    )
     diagnostics = _build_diagnostics(
         regime,
         strategy_returns["base_price_only"],
@@ -1246,12 +1875,51 @@ def run_backtest(
     parameter_sensitivity.to_csv(
         RESULT_DIR / "macro_v3_parameter_sensitivity.csv", index=False
     )
+    base_ablation.to_csv(RESULT_DIR / "macro_base_ablation.csv", index=False)
+    base_parameter_sensitivity.to_csv(
+        RESULT_DIR / "macro_base_parameter_sensitivity.csv", index=False
+    )
+    base_subperiod_metrics.to_csv(RESULT_DIR / "macro_base_subperiod_metrics.csv", index=False)
+    base_opportunity_detail.to_csv(RESULT_DIR / "macro_base_opportunity_cost.csv", index=False)
+    base_opportunity_summary.to_csv(
+        RESULT_DIR / "macro_base_opportunity_summary.csv", index=False
+    )
+    cross_mom_tables["comparison"].to_csv(
+        RESULT_DIR / "macro_cross_mom_comparison.csv", index=False
+    )
+    cross_mom_tables["oos"].to_csv(
+        RESULT_DIR / "macro_cross_mom_oos_metrics.csv", index=False
+    )
+    cross_mom_tables["subperiod"].to_csv(
+        RESULT_DIR / "macro_cross_mom_subperiod_metrics.csv", index=False
+    )
+    cross_mom_tables["drawdown_episodes"].to_csv(
+        RESULT_DIR / "macro_cross_mom_drawdown_episodes.csv", index=False
+    )
+    cross_mom_tables["timing_diagnostics"].to_csv(
+        RESULT_DIR / "macro_cross_mom_timing_diagnostics.csv", index=False
+    )
+    cross_mom_tables["opportunity_detail"].to_csv(
+        RESULT_DIR / "macro_cross_mom_opportunity_cost.csv", index=False
+    )
+    cross_mom_tables["opportunity_summary"].to_csv(
+        RESULT_DIR / "macro_cross_mom_opportunity_summary.csv", index=False
+    )
     _write_research_summary(
         metrics_table,
         cost_sensitivity,
         oos_metrics,
         parameter_sensitivity,
         opportunity_summary,
+        base_ablation,
+        base_parameter_sensitivity,
+        base_subperiod_metrics,
+        base_opportunity_summary,
+        cross_mom_tables["comparison"],
+        cross_mom_tables["oos"],
+        cross_mom_tables["subperiod"],
+        cross_mom_tables["opportunity_summary"],
+        cross_mom_tables["drawdown_episodes"],
         signal_stats,
     )
     logger.info(f"Saved v3 research outputs under {RESULT_DIR}")
