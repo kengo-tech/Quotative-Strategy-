@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+
+.env
+Alpaca.env
+
+data/mr_cache/*.parquet
+logs/
+results/*.csv
+results/*.json
+results/*.png
+results/*.pdf
+results/macro_live_state.json

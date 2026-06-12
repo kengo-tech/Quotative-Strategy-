@@ -1,0 +1,7 @@
+alpaca-py
+apscheduler
+loguru
+numpy
+pandas
+pyarrow
+python-dotenv
