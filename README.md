@@ -70,6 +70,7 @@ portfolio weights for the next tradable period. The diagnostics output records
 ## Files
 
 - `macro_regime_trader.py`: standalone research and paper-trading prototype.
+- `macro_regime_trader_handoff.py`: Python-format handoff checklist for a collaborator.
 - `ALPACA_HANDOFF.md`: paper-trading handoff notes for a collaborator with Alpaca access.
 - `Alpaca.env.example`: template for local Alpaca paper credentials.
 - `results/macro_v3_research_summary.md`: research-methodology summary.
