@@ -70,7 +70,11 @@ portfolio weights for the next tradable period. The diagnostics output records
 ## Files
 
 - `macro_regime_trader.py`: standalone research and paper-trading prototype.
+- `ALPACA_HANDOFF.md`: paper-trading handoff notes for a collaborator with Alpaca access.
+- `Alpaca.env.example`: template for local Alpaca paper credentials.
 - `results/macro_v3_research_summary.md`: research-methodology summary.
+- `results/macro_final_research_report.md`: final report draft.
+- `results/macro_final_presentation_outline.md`: presentation outline.
 - `requirements.txt`: Python dependencies.
 - `data/mr_cache/.gitkeep`: placeholder for optional local cached OHLCV data.
 
@@ -81,3 +85,10 @@ running the backtest after market data is available.
 
 Real-money trading is not enabled. The script keeps `PAPER = True`, and secrets
 such as `Alpaca.env` and `.env` are excluded from version control.
+
+## Scope Note
+
+Option skew is not included in the final hypothesis test. It could be studied
+as a future tail-risk or derivatives-market confirmation layer, but adding it
+to this project would change the research question from price-based equity
+regime control to options-market risk pricing.

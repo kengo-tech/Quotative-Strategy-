@@ -18,6 +18,9 @@ Changes from v2
   signals only affect next-period returns.
 - Adds benchmark comparison, transaction-cost sensitivity, out-of-sample
   metrics, parameter sensitivity, and a markdown research summary.
+- Final implementation reduces turnover by using scale-change-only rebalancing
+  for the defensive overlay; daily and weekly policies are retained as
+  research comparisons, not optimization candidates.
 
 Changes from v1
 ---------------
@@ -108,10 +111,11 @@ for _env in [ROOT_DIR / "Alpaca.env", ROOT_DIR / ".env"]:
         load_dotenv(_env)
         break
 
-# Dedicated MR paper-trading Alpaca account
+# Dedicated MR paper-trading Alpaca account. Keep PAPER=True for this research
+# project; the live engine is intended for Alpaca paper trading only.
 API_KEY    = os.getenv("ALPACA_PAPER_API_KEY_MR")
 API_SECRET = os.getenv("ALPACA_PAPER_API_SECRET_MR")
-PAPER      = True   # flip to False only for real money
+PAPER      = True
 
 # Paths — own cache directory so it doesn't collide with the main engine
 DATA_DIR   = ROOT_DIR / "data" / "mr_cache"
@@ -224,6 +228,13 @@ MAX_LIVE_POSITIONS = 8
 
 # ── Backtest frictions ───────────────────────────────────────────────────────
 TRANSACTION_COST_BPS = 5.0
+
+# Rebalancing policy for the final defensive overlay. The strategy's economic
+# hypothesis is about market-level exposure timing, not daily micro-adjustment
+# of stock weights, so the final candidate only trades when the regime scale
+# changes. Daily and weekly variants are tested separately for robustness.
+FINAL_REBALANCE_POLICY = "scale_change_only"
+REBALANCE_POLICY_GRID = ["daily", "weekly", "scale_change_only"]
 MARKET_IMPACT_COEFF  = 0.10
 ADV_LOOKBACK_DAYS    = 20
 
@@ -838,12 +849,48 @@ def _portfolio_returns(
     cost_bps: float = TRANSACTION_COST_BPS,
     include_market_impact: bool = False,
 ) -> pd.DataFrame:
-    # Weights indexed by signal_date are multiplied by next-period returns.
-    # This explicit shift is the main execution-lag control: a signal observed
-    # at today's close/volume cannot earn today's close-to-close return.
-    fwd = returns[wh.columns].shift(-1)
-    gross = (wh * fwd).sum(axis=1)
-    turnover = wh.diff().abs().sum(axis=1).fillna(wh.abs().sum(axis=1)).rename("turnover")
+    # Target weights indexed by signal_date are applied to the next return
+    # period. This explicit shift is the execution-lag control: a signal
+    # observed at today's close/volume cannot earn today's close-to-close
+    # return.
+    #
+    # The loop is self-financing. If the target row is unchanged, the portfolio
+    # holds existing positions and allows weights to drift with price moves;
+    # turnover is therefore zero. If the target changes, we trade from the
+    # drifted current weights to the new target weights.
+    fwd = returns[wh.columns].shift(-1).reindex(wh.index).fillna(0.0)
+    target_weights = wh.fillna(0.0)
+    target_values = target_weights.to_numpy(dtype=float)
+    return_values = fwd.to_numpy(dtype=float)
+    current = np.zeros(target_values.shape[1], dtype=float)
+    previous_target = None
+    gross_values = np.zeros(len(target_weights), dtype=float)
+    turnover_values = np.zeros(len(target_weights), dtype=float)
+
+    for i in range(len(target_weights)):
+        target = target_values[i]
+        target_changed = (
+            previous_target is None
+            or np.max(np.abs(target - previous_target)) > 1e-12
+        )
+        if target_changed:
+            turnover_values[i] = np.abs(target - current).sum()
+            post_trade = target.copy()
+            previous_target = target.copy()
+        else:
+            post_trade = current.copy()
+
+        asset_return = return_values[i]
+        gross_today = float((post_trade * asset_return).sum())
+        gross_values[i] = gross_today
+        denominator = 1.0 + gross_today
+        if denominator > 1e-12:
+            current = post_trade * (1.0 + asset_return) / denominator
+        else:
+            current = np.zeros_like(current)
+
+    gross = pd.Series(gross_values, index=target_weights.index, name="gross_return")
+    turnover = pd.Series(turnover_values, index=target_weights.index, name="turnover")
     transaction_cost = (turnover * cost_bps / 10_000).rename("transaction_cost")
     if include_market_impact:
         market_impact = _market_impact_cost(wh, dollar_volume)
@@ -909,22 +956,82 @@ def _equal_weight_weights(dates: pd.DatetimeIndex, tradeable: list) -> pd.DataFr
     return wh
 
 
+def _apply_rebalance_policy(
+    target_weights: pd.DataFrame,
+    scale: pd.Series,
+    policy: str = FINAL_REBALANCE_POLICY,
+) -> pd.DataFrame:
+    """
+    Convert daily target weights into executable weights under a rebalancing rule.
+
+    Signals remain lagged exactly as before: the row indexed by signal_date is
+    still applied only to the next return period inside _portfolio_returns().
+    This function only controls how often the target weight is refreshed.
+    """
+    if policy not in REBALANCE_POLICY_GRID:
+        raise ValueError(f"Unknown rebalance policy: {policy}")
+    target = target_weights.fillna(0.0)
+    if policy == "daily":
+        return target
+
+    scale = scale.reindex(target.index).fillna(0.0)
+    held = pd.DataFrame(0.0, index=target.index, columns=target.columns)
+    current = pd.Series(0.0, index=target.columns)
+    previous_week = None
+    previous_scale = None
+
+    for dt in target.index:
+        row = target.loc[dt]
+        scale_today = float(scale.loc[dt])
+        if hasattr(dt, "isocalendar"):
+            iso = dt.isocalendar()
+            week_key = (int(iso.year), int(iso.week))
+        else:
+            week_key = pd.Timestamp(dt).to_period("W")
+
+        has_live_target = float(row.abs().sum()) > 1e-12
+        needs_initial_trade = has_live_target and float(current.abs().sum()) <= 1e-12
+
+        if policy == "weekly":
+            should_rebalance = needs_initial_trade or week_key != previous_week
+        else:
+            scale_changed = (
+                previous_scale is not None
+                and abs(scale_today - previous_scale) > 1e-12
+            )
+            should_rebalance = needs_initial_trade or scale_changed
+
+        if should_rebalance:
+            current = row.copy()
+
+        held.loc[dt] = current
+        previous_week = week_key
+        previous_scale = scale_today
+
+    return held
+
+
 def _strategy_weight_map(
     returns: pd.DataFrame,
     tradeable: list,
     dates: pd.DatetimeIndex,
     regime: pd.DataFrame,
     base_rp_weights: pd.DataFrame | None = None,
+    rebalance_policy: str = FINAL_REBALANCE_POLICY,
 ) -> dict:
     base_rp_weights = base_rp_weights if base_rp_weights is not None else _walk_forward_base_weights(
         returns, tradeable, dates
     )
+    base_target = base_rp_weights.mul(regime["base_scale"].reindex(dates), axis=0)
+    v3_target = base_rp_weights.mul(regime["final_scale"].reindex(dates), axis=0)
     return {
         "equal_weight_10_stock": _equal_weight_weights(dates, tradeable),
         "risk_parity_no_overlay": base_rp_weights,
-        "base_price_only": base_rp_weights.mul(regime["base_scale"].reindex(dates), axis=0),
-        "price_plus_spy_volume_confirmation": base_rp_weights.mul(
-            regime["final_scale"].reindex(dates), axis=0
+        "base_price_only": _apply_rebalance_policy(
+            base_target, regime["base_scale"], rebalance_policy
+        ),
+        "price_plus_spy_volume_confirmation": _apply_rebalance_policy(
+            v3_target, regime["final_scale"], rebalance_policy
         ),
     }
 
@@ -1166,6 +1273,277 @@ def _cost_sensitivity_table(
     return pd.concat(rows, ignore_index=True)
 
 
+def _rebalance_policy_tables(
+    base_rp_weights: pd.DataFrame,
+    regime: pd.DataFrame,
+    returns: pd.DataFrame,
+    dollar_volume: pd.DataFrame,
+    dates: pd.DatetimeIndex,
+    close: pd.DataFrame,
+) -> tuple[
+    pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame,
+    pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame,
+]:
+    base_target = base_rp_weights.mul(regime["base_scale"].reindex(dates), axis=0)
+    rows = []
+    cost_rows = []
+    oos_rows = []
+    subperiod_rows = []
+    turnover_rows = []
+    drawdown_rows = []
+    annual_turnover_rows = []
+    trade_attribution_rows = []
+    scale = regime["base_scale"].reindex(dates).fillna(0.0)
+    scale_changes = int((scale.diff().abs() > 1e-12).sum())
+    policy_frames = {}
+    policy_weights = {}
+
+    for policy in REBALANCE_POLICY_GRID:
+        wh = _apply_rebalance_policy(base_target, scale, policy)
+        policy_weights[policy] = wh
+        for cost_bps in COST_SCENARIOS_BPS:
+            frame = _portfolio_returns(
+                wh,
+                returns,
+                dollar_volume,
+                apply_costs=True,
+                cost_bps=cost_bps,
+                include_market_impact=False,
+            ).iloc[RISK_LOOKBACK_DAYS:-1].dropna()
+            metrics = _performance_metrics(frame["net_return"], frame["turnover"])
+            trade_days = int((frame["turnover"] > 1e-12).sum())
+            row = {
+                "rebalance_policy": policy,
+                "cost_bps": cost_bps,
+                **metrics,
+                "annualized_turnover": round(metrics["avg_daily_turnover"] * TRADING_DAYS, 4),
+                "trade_day_count": trade_days,
+                "trade_days_per_year": round(trade_days / (len(frame) / TRADING_DAYS), 2)
+                if len(frame) else 0.0,
+                "scale_change_count": scale_changes,
+            }
+            cost_rows.append(row)
+            if cost_bps == TRANSACTION_COST_BPS:
+                rows.append(row)
+                policy_frames[policy] = frame
+
+    full_index = next(iter(policy_frames.values())).index if policy_frames else pd.DatetimeIndex([])
+    split = int(len(full_index) * 0.70)
+    samples = {
+        "full_sample": full_index,
+        "in_sample": full_index[:split],
+        "out_of_sample": full_index[split:],
+    }
+    periods = {
+        "2010_2016": ("2010-01-01", "2016-12-31"),
+        "2017_2020": ("2017-01-01", "2020-12-31"),
+        "2021_plus": ("2021-01-01", None),
+    }
+
+    for policy, frame in policy_frames.items():
+        for sample, idx in samples.items():
+            local = frame.reindex(idx).dropna()
+            oos_rows.append({
+                "rebalance_policy": policy,
+                "sample": sample,
+                **_performance_metrics(local["net_return"], local["turnover"]),
+            })
+
+        for period, (start, end) in periods.items():
+            idx = frame.index[frame.index >= pd.Timestamp(start, tz="UTC")]
+            if end:
+                idx = idx[idx <= pd.Timestamp(end, tz="UTC")]
+            local = frame.reindex(idx).dropna()
+            if local.empty:
+                continue
+            subperiod_rows.append({
+                "rebalance_policy": policy,
+                "period": period,
+                **_performance_metrics(local["net_return"], local["turnover"]),
+            })
+
+        turnover = frame["turnover"].dropna()
+        trade_turnover = turnover[turnover > 1e-12]
+        n_years = len(frame) / TRADING_DAYS if len(frame) else 0.0
+        target_exposure = policy_weights[policy].abs().sum(axis=1).reindex(frame.index)
+        turnover_rows.append({
+            "rebalance_policy": policy,
+            "n_days": len(frame),
+            "trade_day_count": int((turnover > 1e-12).sum()),
+            "trade_days_per_year": round(int((turnover > 1e-12).sum()) / n_years, 2)
+            if n_years else 0.0,
+            "scale_change_count": scale_changes,
+            "avg_daily_turnover": round(float(turnover.mean()), 4),
+            "annualized_turnover": round(float(turnover.mean()) * TRADING_DAYS, 4),
+            "median_turnover": round(float(turnover.median()), 4),
+            "avg_turnover_on_trade_days": round(float(trade_turnover.mean()), 4)
+            if len(trade_turnover) else 0.0,
+            "p75_turnover": round(float(turnover.quantile(0.75)), 4),
+            "p90_turnover": round(float(turnover.quantile(0.90)), 4),
+            "p95_turnover": round(float(turnover.quantile(0.95)), 4),
+            "p99_turnover": round(float(turnover.quantile(0.99)), 4),
+            "max_turnover": round(float(turnover.max()), 4),
+            "share_turnover_gt_1pct": round(float((turnover > 0.01).mean()), 4),
+            "share_turnover_gt_5pct": round(float((turnover > 0.05).mean()), 4),
+            "share_turnover_gt_10pct": round(float((turnover > 0.10).mean()), 4),
+            "share_turnover_gt_20pct": round(float((turnover > 0.20).mean()), 4),
+            "avg_target_exposure": round(float(target_exposure.mean()), 4),
+        })
+
+        annual = pd.DataFrame({"turnover": turnover})
+        annual["year"] = annual.index.year
+        for year, year_data in annual.groupby("year"):
+            annual_turnover_rows.append({
+                "rebalance_policy": policy,
+                "year": int(year),
+                "n_days": int(len(year_data)),
+                "trade_day_count": int((year_data["turnover"] > 1e-12).sum()),
+                "avg_daily_turnover": round(float(year_data["turnover"].mean()), 4),
+                "annualized_turnover": round(float(year_data["turnover"].mean()) * TRADING_DAYS, 4),
+                "total_turnover": round(float(year_data["turnover"].sum()), 4),
+                "max_daily_turnover": round(float(year_data["turnover"].max()), 4),
+            })
+
+        prev_target = None
+        prev_scale = None
+        prev_rp = None
+        attribution = {
+            "initial_allocation": {"count": 0, "turnover": 0.0},
+            "scale_only": {"count": 0, "turnover": 0.0},
+            "risk_parity_only": {"count": 0, "turnover": 0.0},
+            "scale_and_risk_parity": {"count": 0, "turnover": 0.0},
+        }
+        for dt in frame.index:
+            turnover_today = float(frame.loc[dt, "turnover"])
+            if turnover_today <= 1e-12:
+                continue
+            target_today = policy_weights[policy].loc[dt]
+            rp_today = base_rp_weights.loc[dt]
+            scale_today = float(scale.loc[dt])
+            if prev_target is None or float(prev_target.abs().sum()) <= 1e-12:
+                reason = "initial_allocation"
+            else:
+                scale_changed = abs(scale_today - prev_scale) > 1e-12
+                rp_changed = float((rp_today - prev_rp).abs().max()) > 1e-12
+                if scale_changed and rp_changed:
+                    reason = "scale_and_risk_parity"
+                elif scale_changed:
+                    reason = "scale_only"
+                elif rp_changed:
+                    reason = "risk_parity_only"
+                else:
+                    # The target can be unchanged while actual weights drift;
+                    # this bucket is intentionally mapped to risk parity only
+                    # because the executed target was not triggered by scale.
+                    reason = "risk_parity_only"
+            attribution[reason]["count"] += 1
+            attribution[reason]["turnover"] += turnover_today
+            prev_target = target_today.copy()
+            prev_scale = scale_today
+            prev_rp = rp_today.copy()
+
+        total_attributed_turnover = sum(v["turnover"] for v in attribution.values())
+        for reason, values in attribution.items():
+            trade_attribution_rows.append({
+                "rebalance_policy": policy,
+                "trade_reason": reason,
+                "trade_day_count": values["count"],
+                "total_turnover": round(values["turnover"], 4),
+                "share_of_turnover": round(
+                    values["turnover"] / (total_attributed_turnover + 1e-12), 4
+                ),
+            })
+
+    spy = close[MARKET_PROXY].dropna()
+    spy_dd = spy / spy.cummax() - 1.0
+    in_dd = spy_dd <= -0.10
+    episodes = []
+    start = None
+    prev_dt = None
+    for dt, active in in_dd.items():
+        if active and start is None:
+            start = dt
+        elif not active and start is not None:
+            episodes.append((start, prev_dt))
+            start = None
+        prev_dt = dt
+    if start is not None:
+        episodes.append((start, spy_dd.index[-1]))
+
+    for episode_no, (start_dt, end_dt) in enumerate(episodes, start=1):
+        for policy, frame in policy_frames.items():
+            idx = frame.index[(frame.index >= start_dt) & (frame.index <= end_dt)]
+            if len(idx) == 0:
+                continue
+            local = frame.reindex(idx).dropna()
+            local_spy_dd = spy_dd.reindex(idx).dropna()
+            exposure = policy_weights[policy].abs().sum(axis=1).reindex(idx)
+            prior_idx = policy_weights[policy].index[policy_weights[policy].index < start_dt]
+            prior_exposure = (
+                float(policy_weights[policy].abs().sum(axis=1).reindex(prior_idx).iloc[-1])
+                if len(prior_idx) else np.nan
+            )
+            exposure_values = exposure.dropna()
+            first_derisk_date = pd.NaT
+            days_to_first_derisk = np.nan
+            min_exposure_date = pd.NaT
+            days_to_min_exposure = np.nan
+            first_rerisk_date = pd.NaT
+            days_to_first_rerisk_after_min = np.nan
+            if len(exposure_values):
+                if not np.isnan(prior_exposure):
+                    derisk = exposure_values < prior_exposure - 0.05
+                    if derisk.any():
+                        first_derisk_date = derisk[derisk].index[0]
+                        days_to_first_derisk = int(exposure_values.index.get_loc(first_derisk_date))
+                min_exposure_date = exposure_values.idxmin()
+                days_to_min_exposure = int(exposure_values.index.get_loc(min_exposure_date))
+                after_min = exposure_values.loc[min_exposure_date:]
+                rerisk = after_min > float(exposure_values.loc[min_exposure_date]) + 0.05
+                if rerisk.any():
+                    first_rerisk_date = rerisk[rerisk].index[0]
+                    days_to_first_rerisk_after_min = int(
+                        exposure_values.index.get_loc(first_rerisk_date)
+                        - exposure_values.index.get_loc(min_exposure_date)
+                    )
+            drawdown_rows.append({
+                "episode": episode_no,
+                "rebalance_policy": policy,
+                "start_date": start_dt,
+                "end_date": end_dt,
+                "n_days": len(idx),
+                "spy_min_drawdown": round(float(local_spy_dd.min()), 4)
+                if len(local_spy_dd) else 0.0,
+                "strategy_episode_return": round(float((1.0 + local["net_return"]).prod() - 1.0), 4)
+                if len(local) else 0.0,
+                "strategy_episode_max_drawdown": round(_max_drawdown_from_returns(local["net_return"]), 4),
+                "avg_target_exposure": round(float(exposure.mean()), 4),
+                "min_target_exposure": round(float(exposure.min()), 4),
+                "max_target_exposure": round(float(exposure.max()), 4),
+                "prior_target_exposure": round(prior_exposure, 4)
+                if not np.isnan(prior_exposure) else np.nan,
+                "first_derisk_date": first_derisk_date,
+                "days_to_first_derisk": days_to_first_derisk,
+                "min_exposure_date": min_exposure_date,
+                "days_to_min_exposure": days_to_min_exposure,
+                "first_rerisk_date": first_rerisk_date,
+                "days_to_first_rerisk_after_min": days_to_first_rerisk_after_min,
+                "total_turnover": round(float(local["turnover"].sum()), 4),
+                "trade_day_count": int((local["turnover"] > 1e-12).sum()),
+            })
+
+    return (
+        pd.DataFrame(rows),
+        pd.DataFrame(cost_rows),
+        pd.DataFrame(oos_rows),
+        pd.DataFrame(subperiod_rows),
+        pd.DataFrame(turnover_rows),
+        pd.DataFrame(drawdown_rows),
+        pd.DataFrame(annual_turnover_rows),
+        pd.DataFrame(trade_attribution_rows),
+    )
+
+
 def _oos_metrics_table(strategy_returns: dict, spy_returns: pd.Series) -> pd.DataFrame:
     common_index = strategy_returns["base_price_only"].index
     split = int(len(common_index) * 0.70)
@@ -1197,7 +1575,8 @@ def _parameter_sensitivity_table(
             for volume_weight in VOLUME_CONFIRMATION_WEIGHT_GRID:
                 params = _volume_params(ftd_min_return, strong_breakout, volume_weight)
                 regime = compute_regime(close, data, True, params)
-                wh = base_rp_weights.mul(regime["final_scale"].reindex(dates), axis=0)
+                target = base_rp_weights.mul(regime["final_scale"].reindex(dates), axis=0)
+                wh = _apply_rebalance_policy(target, regime["final_scale"])
                 frame = _portfolio_returns(
                     wh, returns, dollar_volume, True, TRANSACTION_COST_BPS, False
                 ).iloc[RISK_LOOKBACK_DAYS:-1].dropna()
@@ -1234,7 +1613,8 @@ def _base_ablation_table(
     for spec_name, cols in specs.items():
         composite = components[cols].mean(axis=1).clip(-1.0, 1.0).rename("price_composite")
         scale = _scale_from_composite(composite)
-        wh = base_rp_weights.mul(scale.reindex(dates), axis=0)
+        target = base_rp_weights.mul(scale.reindex(dates), axis=0)
+        wh = _apply_rebalance_policy(target, scale)
         frame = _portfolio_returns(
             wh, returns, dollar_volume, True, TRANSACTION_COST_BPS, False
         ).iloc[RISK_LOOKBACK_DAYS:-1].dropna()
@@ -1270,7 +1650,8 @@ def _base_parameter_sensitivity_table(
                         vol_long=vol_long,
                     )
                     scale = _scale_from_composite(composite)
-                    wh = base_rp_weights.mul(scale.reindex(dates), axis=0)
+                    target = base_rp_weights.mul(scale.reindex(dates), axis=0)
+                    wh = _apply_rebalance_policy(target, scale)
                     frame = _portfolio_returns(
                         wh, returns, dollar_volume, True, TRANSACTION_COST_BPS, False
                     ).iloc[RISK_LOOKBACK_DAYS:-1].dropna()
@@ -1413,7 +1794,8 @@ def _cross_mom_research_tables(
     final_composite = regime["price_composite"].rename("price_composite_without_cross_mom")
     final_scale = regime["base_scale"].rename("scale_without_cross_mom")
 
-    legacy_weights = base_rp_weights.mul(legacy_scale.reindex(dates), axis=0)
+    legacy_target = base_rp_weights.mul(legacy_scale.reindex(dates), axis=0)
+    legacy_weights = _apply_rebalance_policy(legacy_target, legacy_scale)
     legacy_returns = _portfolio_returns(
         legacy_weights,
         returns,
@@ -1586,6 +1968,14 @@ def _df_to_markdown(df: pd.DataFrame) -> str:
 def _write_research_summary(
     metrics: pd.DataFrame,
     cost_sensitivity: pd.DataFrame,
+    rebalance_policy_comparison: pd.DataFrame,
+    rebalance_policy_cost: pd.DataFrame,
+    rebalance_policy_oos: pd.DataFrame,
+    rebalance_policy_subperiod: pd.DataFrame,
+    rebalance_policy_turnover: pd.DataFrame,
+    rebalance_policy_drawdown: pd.DataFrame,
+    rebalance_policy_annual_turnover: pd.DataFrame,
+    rebalance_policy_trade_attribution: pd.DataFrame,
     oos_metrics: pd.DataFrame,
     parameter_sensitivity: pd.DataFrame,
     opportunity_summary: pd.DataFrame,
@@ -1637,10 +2027,10 @@ def _write_research_summary(
         "The v3 model tested whether FTD and SPY volume confirmation improve risk-on timing. Empirically, v3 slightly reduced volatility and Max Drawdown, but worsened Calmar because opportunity cost exceeded loss avoided. This suggests that unconditional daily volume penalties are too noisy and too costly. Therefore, the final strategy candidate returns to the simpler `base_price_only` macro regime overlay, and robustness tests focus on whether the base model is stable across signal ablations, parameter choices, subperiods, and opportunity-cost diagnostics.",
         "",
         "## 2. Economic rationale",
-        "The base model estimates broad equity risk appetite from SPY volatility, trend, market breadth, volatility regime, and cross-sectional momentum. The v3 layer asks whether SPY volume confirmation adds information about institutional accumulation or distribution.",
+        "The final base model estimates broad equity risk appetite from SPY volatility, SPY trend, market breadth, and the volatility regime. Cross-sectional momentum and SPY volume confirmation were tested as extensions, but are not part of the final defensive specification.",
         "",
         "## 3. Signal design",
-        "The control strategy is `base_price_only`. The tested strategy is `price_plus_spy_volume_confirmation`, which blends the base price composite with volume breakout, Follow-Through Day, Distribution Day, and Heavy Distribution Day evidence. A Follow-Through Day occurs after a rally attempt when SPY rises at least 1.25% on higher volume without undercutting the rally low.",
+        "The control strategy is `base_price_only`, now defined as the Defensive 4-Signal Macro Regime Overlay. The tested v3 extension is `price_plus_spy_volume_confirmation`, which blends the base price composite with volume breakout, Follow-Through Day, Distribution Day, and Heavy Distribution Day evidence. A Follow-Through Day occurs after a rally attempt when SPY rises at least 1.25% on higher volume without undercutting the rally low.",
         "",
         "## Rule-based mathematical definitions",
         "",
@@ -1666,7 +2056,7 @@ def _write_research_summary(
         "",
         "Volume confirmation score: \\(S^{VOL}_t=clip(0.25\\,BRK_t+1.00\\,FTD_t-0.35\\,DIST_t-0.75\\,HDIST_t-0.25\\,CLUST_t,-1,1)\\), where \\(BRK_t=1\\{r^{SPY}_t>0, V_t/MA_{50}(V)_t \\ge 1.10\\}\\) and \\(CLUST_t=1\\{\\sum_{i=0}^{24}DIST_{t-i}\\ge4\\}\\).",
         "",
-        "Base regime score: \\(S^{BASE}_t\\) is the existing price-only composite in \\([-1,1]\\), averaging the VIX proxy, SPY trend, market breadth, volatility regime, and cross-sectional momentum indicators.",
+        "Base regime score: \\(S^{BASE}_t\\) is the final price-only composite in \\([-1,1]\\), averaging the VIX proxy, SPY trend, market breadth, and volatility-regime indicators. The 12-1 month cross-momentum indicator is reported as an ablation/extension, but excluded from the final specification.",
         "",
         "Final v3 regime score: \\(S^{V3}_t=clip((1-\\lambda)S^{BASE}_t+\\lambda S^{VOL}_t,-1,1)\\).",
         "",
@@ -1693,6 +2083,34 @@ def _write_research_summary(
         "",
         "## 7. Transaction cost sensitivity",
         _df_to_markdown(cost_sensitivity),
+        "",
+        "## 7b. Rebalancing policy and turnover control",
+        "The final defensive overlay uses `scale_change_only` rebalancing because the research hypothesis is about market-level exposure timing, not daily stock-level micro-rebalancing. Daily and weekly variants are reported as implementation robustness checks.",
+        "",
+        _df_to_markdown(rebalance_policy_comparison),
+        "",
+        "### Rebalancing policy cost sensitivity",
+        _df_to_markdown(rebalance_policy_cost),
+        "",
+        "### Rebalancing policy OOS robustness",
+        _df_to_markdown(rebalance_policy_oos),
+        "",
+        "### Rebalancing policy subperiod robustness",
+        _df_to_markdown(rebalance_policy_subperiod),
+        "",
+        "### Rebalancing policy turnover distribution",
+        _df_to_markdown(rebalance_policy_turnover),
+        "",
+        "### Rebalancing policy annual turnover",
+        _df_to_markdown(rebalance_policy_annual_turnover),
+        "",
+        "### Rebalancing policy trade attribution",
+        "This table separates trades driven by scale changes from trades driven by risk-parity weight refreshes. For the final `scale_change_only` policy, trades are only triggered when the regime scale changes, although the refreshed target can also incorporate updated risk-parity weights.",
+        "",
+        _df_to_markdown(rebalance_policy_trade_attribution),
+        "",
+        "### Rebalancing policy drawdown episodes",
+        _df_to_markdown(rebalance_policy_drawdown),
         "",
         "## 8. Out-of-sample results",
         _df_to_markdown(oos_metrics),
@@ -1743,6 +2161,8 @@ def _write_research_summary(
         "",
         "## 10. Conclusion",
         conclusion,
+        "",
+        "The final submitted strategy candidate is therefore the Defensive 4-Signal Macro Regime Overlay with scale-change-only rebalancing. This keeps the implementation aligned with the economic hypothesis: trade when market-level risk exposure changes, not when small daily risk-parity estimates drift.",
     ]
     (RESULT_DIR / "macro_v3_research_summary.md").write_text("\n".join(lines), encoding="utf-8")
 
@@ -1820,6 +2240,18 @@ def run_backtest(
 
     metrics_table = _metrics_table(strategy_returns, spy_fwd_returns)
     cost_sensitivity = _cost_sensitivity_table(weights, returns, dollar_volume, spy_fwd_returns)
+    (
+        rebalance_policy_comparison,
+        rebalance_policy_cost,
+        rebalance_policy_oos,
+        rebalance_policy_subperiod,
+        rebalance_policy_turnover,
+        rebalance_policy_drawdown,
+        rebalance_policy_annual_turnover,
+        rebalance_policy_trade_attribution,
+    ) = _rebalance_policy_tables(
+        base_rp_weights, regime, returns, dollar_volume, dates, close
+    )
     oos_metrics = _oos_metrics_table(strategy_returns, spy_fwd_returns)
     parameter_sensitivity = _parameter_sensitivity_table(
         close, data, returns, dollar_volume, tradeable, dates, base_rp_weights
@@ -1870,6 +2302,30 @@ def run_backtest(
     metrics_table.to_csv(RESULT_DIR / "macro_v3_metrics_comparison.csv", index=False)
     diagnostics.to_csv(RESULT_DIR / "macro_v3_diagnostics.csv", index=False)
     cost_sensitivity.to_csv(RESULT_DIR / "macro_v3_cost_sensitivity.csv", index=False)
+    rebalance_policy_comparison.to_csv(
+        RESULT_DIR / "macro_rebalance_policy_comparison.csv", index=False
+    )
+    rebalance_policy_cost.to_csv(
+        RESULT_DIR / "macro_rebalance_policy_cost_sensitivity.csv", index=False
+    )
+    rebalance_policy_oos.to_csv(
+        RESULT_DIR / "macro_rebalance_policy_oos_metrics.csv", index=False
+    )
+    rebalance_policy_subperiod.to_csv(
+        RESULT_DIR / "macro_rebalance_policy_subperiod_metrics.csv", index=False
+    )
+    rebalance_policy_turnover.to_csv(
+        RESULT_DIR / "macro_rebalance_policy_turnover_breakdown.csv", index=False
+    )
+    rebalance_policy_drawdown.to_csv(
+        RESULT_DIR / "macro_rebalance_policy_drawdown_episodes.csv", index=False
+    )
+    rebalance_policy_annual_turnover.to_csv(
+        RESULT_DIR / "macro_rebalance_policy_annual_turnover.csv", index=False
+    )
+    rebalance_policy_trade_attribution.to_csv(
+        RESULT_DIR / "macro_rebalance_policy_trade_attribution.csv", index=False
+    )
     oos_metrics.to_csv(RESULT_DIR / "macro_v3_oos_metrics.csv", index=False)
     opportunity_detail.to_csv(RESULT_DIR / "macro_v3_opportunity_cost.csv", index=False)
     parameter_sensitivity.to_csv(
@@ -1908,6 +2364,14 @@ def run_backtest(
     _write_research_summary(
         metrics_table,
         cost_sensitivity,
+        rebalance_policy_comparison,
+        rebalance_policy_cost,
+        rebalance_policy_oos,
+        rebalance_policy_subperiod,
+        rebalance_policy_turnover,
+        rebalance_policy_drawdown,
+        rebalance_policy_annual_turnover,
+        rebalance_policy_trade_attribution,
         oos_metrics,
         parameter_sensitivity,
         opportunity_summary,
